@@ -2,8 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
-using System.Security.Claims;
 using System.Globalization;
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication.OAuth.Claims;
 using Microsoft.AspNetCore.Http;
 
@@ -35,6 +35,7 @@ namespace Microsoft.AspNetCore.Authentication.Twitter
                 SecurePolicy = CookieSecurePolicy.SameAsRequest,
                 HttpOnly = true,
                 SameSite = SameSiteMode.Lax,
+                IsEssential = true,
             };
         }
 

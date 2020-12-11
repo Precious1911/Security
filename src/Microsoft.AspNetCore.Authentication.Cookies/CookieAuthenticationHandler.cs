@@ -14,10 +14,7 @@ using Microsoft.Net.Http.Headers;
 
 namespace Microsoft.AspNetCore.Authentication.Cookies
 {
-    public class CookieAuthenticationHandler :
-        AuthenticationHandler<CookieAuthenticationOptions>,
-        IAuthenticationSignInHandler,
-        IAuthenticationSignOutHandler
+    public class CookieAuthenticationHandler : SignInAuthenticationHandler<CookieAuthenticationOptions>
     {
         private const string HeaderValueNoCache = "no-cache";
         private const string HeaderValueEpocDate = "Thu, 01 Jan 1970 00:00:00 GMT";
@@ -31,6 +28,7 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
         private DateTimeOffset? _refreshExpiresUtc;
         private string _sessionKey;
         private Task<AuthenticateResult> _readCookieTask;
+        private AuthenticationTicket _refreshTicket;
 
         public CookieAuthenticationHandler(IOptionsMonitor<CookieAuthenticationOptions> options, ILoggerFactory logger, UrlEncoder encoder, ISystemClock clock)
             : base(options, logger, encoder, clock)
@@ -87,7 +85,7 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
             }
         }
 
-        private void RequestRefresh(AuthenticationTicket ticket)
+        private void RequestRefresh(AuthenticationTicket ticket, ClaimsPrincipal replacedPrincipal = null)
         {
             var issuedUtc = ticket.Properties.IssuedUtc;
             var expiresUtc = ticket.Properties.ExpiresUtc;
@@ -99,7 +97,26 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
                 _refreshIssuedUtc = currentUtc;
                 var timeSpan = expiresUtc.Value.Subtract(issuedUtc.Value);
                 _refreshExpiresUtc = currentUtc.Add(timeSpan);
+                _refreshTicket = CloneTicket(ticket, replacedPrincipal);
             }
+        }
+
+        private AuthenticationTicket CloneTicket(AuthenticationTicket ticket, ClaimsPrincipal replacedPrincipal)
+        {
+            var principal = replacedPrincipal ?? ticket.Principal;
+            var newPrincipal = new ClaimsPrincipal();
+            foreach (var identity in principal.Identities)
+            {
+                newPrincipal.AddIdentity(identity.Clone());
+            }
+
+            var newProperties = new AuthenticationProperties();
+            foreach (var item in ticket.Properties.Items)
+            {
+                newProperties.Items[item.Key] = item.Value;
+            }
+
+            return new AuthenticationTicket(newPrincipal, newProperties, ticket.AuthenticationScheme);
         }
 
         private async Task<AuthenticateResult> ReadCookieTicket()
@@ -167,7 +184,7 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
 
             if (context.ShouldRenew)
             {
-                RequestRefresh(result.Ticket);
+                RequestRefresh(result.Ticket, context.Principal);
             }
 
             return AuthenticateResult.Success(new AuthenticationTicket(context.Principal, context.Properties, Scheme.Name));
@@ -190,7 +207,7 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
                 return;
             }
 
-            var ticket = (await HandleAuthenticateOnceSafeAsync())?.Ticket;
+            var ticket = _refreshTicket;
             if (ticket != null)
             {
                 var properties = ticket.Properties;
@@ -233,7 +250,7 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
             }
         }
 
-        public async virtual Task SignInAsync(ClaimsPrincipal user, AuthenticationProperties properties)
+        protected async override Task HandleSignInAsync(ClaimsPrincipal user, AuthenticationProperties properties)
         {
             if (user == null)
             {
@@ -320,7 +337,7 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
             Logger.SignedIn(Scheme.Name);
         }
 
-        public async virtual Task SignOutAsync(AuthenticationProperties properties)
+        protected async override Task HandleSignOutAsync(AuthenticationProperties properties)
         {
             properties = properties ?? new AuthenticationProperties();
 
@@ -405,7 +422,7 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
             var returnUrl = properties.RedirectUri;
             if (string.IsNullOrEmpty(returnUrl))
             {
-                returnUrl = OriginalPathBase + Request.Path + Request.QueryString;
+                returnUrl = OriginalPathBase + OriginalPath + Request.QueryString;
             }
             var accessDeniedUri = Options.AccessDeniedPath + QueryString.Create(Options.ReturnUrlParameter, returnUrl);
             var redirectContext = new RedirectContext<CookieAuthenticationOptions>(Context, Scheme, Options, properties, BuildRedirectUri(accessDeniedUri));
@@ -417,7 +434,7 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
             var redirectUri = properties.RedirectUri;
             if (string.IsNullOrEmpty(redirectUri))
             {
-                redirectUri = OriginalPathBase + Request.Path + Request.QueryString;
+                redirectUri = OriginalPathBase + OriginalPath + Request.QueryString;
             }
 
             var loginUri = Options.LoginPath + QueryString.Create(Options.ReturnUrlParameter, redirectUri);

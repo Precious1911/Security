@@ -2,7 +2,6 @@
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
-using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -22,21 +21,16 @@ using Xunit;
 
 namespace Microsoft.AspNetCore.Authentication.Cookies
 {
-    public class CookieTests
+    public class CookieTests : SharedAuthenticationTests<CookieAuthenticationOptions>
     {
         private TestClock _clock = new TestClock();
 
-        [Fact]
-        public async Task VerifySchemeDefaults()
+        protected override string DefaultScheme => CookieAuthenticationDefaults.AuthenticationScheme;
+        protected override Type HandlerType => typeof(CookieAuthenticationHandler);
+
+        protected override void RegisterAuth(AuthenticationBuilder services, Action<CookieAuthenticationOptions> configure)
         {
-            var services = new ServiceCollection();
-            services.AddAuthentication().AddCookie();
-            var sp = services.BuildServiceProvider();
-            var schemeProvider = sp.GetRequiredService<IAuthenticationSchemeProvider>();
-            var scheme = await schemeProvider.GetSchemeAsync(CookieAuthenticationDefaults.AuthenticationScheme);
-            Assert.NotNull(scheme);
-            Assert.Equal("CookieAuthenticationHandler", scheme.HandlerType.Name);
-            Assert.Null(scheme.DisplayName);
+            services.AddCookie(configure);
         }
 
         [Fact]
@@ -105,8 +99,10 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
 
         private Task SignInAsAlice(HttpContext context)
         {
+            var user = new ClaimsIdentity(new GenericIdentity("Alice", "Cookies"));
+            user.AddClaim(new Claim("marker", "true"));
             return context.SignInAsync("Cookies",
-                new ClaimsPrincipal(new ClaimsIdentity(new GenericIdentity("Alice", "Cookies"))),
+                new ClaimsPrincipal(user),
                 new AuthenticationProperties());
         }
 
@@ -489,6 +485,80 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
         }
 
         [Fact]
+        public async Task CookieCanBeReplacedByValidator()
+        {
+            var server = CreateServer(o =>
+            {
+                o.Events = new CookieAuthenticationEvents
+                {
+                    OnValidatePrincipal = ctx =>
+                    {
+                        ctx.ShouldRenew = true;
+                        ctx.ReplacePrincipal(new ClaimsPrincipal(new ClaimsIdentity(new GenericIdentity("Alice2", "Cookies2"))));
+                        return Task.FromResult(0);
+                    }
+                };
+            },
+            context =>
+                context.SignInAsync("Cookies",
+                    new ClaimsPrincipal(new ClaimsIdentity(new GenericIdentity("Alice", "Cookies")))));
+
+            var transaction1 = await SendAsync(server, "http://example.com/testpath");
+
+            var transaction2 = await SendAsync(server, "http://example.com/me/Cookies", transaction1.CookieNameValue);
+            Assert.NotNull(transaction2.SetCookie);
+            Assert.Equal("Alice2", FindClaimValue(transaction2, ClaimTypes.Name));
+        }
+
+        [Fact]
+        public async Task CookieCanBeUpdatedByValidatorDuringRefresh()
+        {
+            var replace = false;
+            var server = CreateServer(o =>
+            {
+                o.ExpireTimeSpan = TimeSpan.FromMinutes(10);
+                o.Events = new CookieAuthenticationEvents
+                {
+                    OnValidatePrincipal = ctx =>
+                    {
+                        if (replace)
+                        {
+                            ctx.ShouldRenew = true;
+                            ctx.ReplacePrincipal(new ClaimsPrincipal(new ClaimsIdentity(new GenericIdentity("Alice2", "Cookies2"))));
+                            ctx.Properties.Items["updated"] = "yes";
+                        }
+                        return Task.FromResult(0);
+                    }
+                };
+            },
+            context =>
+                context.SignInAsync("Cookies",
+                    new ClaimsPrincipal(new ClaimsIdentity(new GenericIdentity("Alice", "Cookies")))));
+
+            var transaction1 = await SendAsync(server, "http://example.com/testpath");
+
+            var transaction2 = await SendAsync(server, "http://example.com/me/Cookies", transaction1.CookieNameValue);
+            Assert.Equal("Alice", FindClaimValue(transaction2, ClaimTypes.Name));
+
+            var transaction3 = await SendAsync(server, "http://example.com/me/Cookies", transaction1.CookieNameValue);
+            Assert.Equal("Alice", FindClaimValue(transaction2, ClaimTypes.Name));
+            Assert.Null(FindPropertiesValue(transaction3, "updated"));
+
+            replace = true;
+
+            var transaction4 = await SendAsync(server, "http://example.com/me/Cookies", transaction1.CookieNameValue);
+            Assert.NotNull(transaction4.SetCookie);
+            Assert.Equal("Alice2", FindClaimValue(transaction4, ClaimTypes.Name));
+            Assert.Equal("yes", FindPropertiesValue(transaction4, "updated"));
+
+            replace = false;
+
+            var transaction5 = await SendAsync(server, "http://example.com/me/Cookies", transaction4.CookieNameValue);
+            Assert.Equal("Alice2", FindClaimValue(transaction5, ClaimTypes.Name));
+            Assert.Equal("yes", FindPropertiesValue(transaction4, "updated"));
+        }
+
+        [Fact]
         public async Task CookieCanBeRenewedByValidatorWithSlidingExpiry()
         {
             var server = CreateServer(o =>
@@ -530,6 +600,61 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
             var transaction5 = await SendAsync(server, "http://example.com/me/Cookies", transaction4.CookieNameValue);
             Assert.Null(transaction5.SetCookie);
             Assert.Null(FindClaimValue(transaction5, ClaimTypes.Name));
+        }
+
+        [Fact]
+        public async Task CookieCanBeRenewedByValidatorWithModifiedProperties()
+        {
+            var server = CreateServer(o =>
+            {
+                o.ExpireTimeSpan = TimeSpan.FromMinutes(10);
+                o.Events = new CookieAuthenticationEvents
+                {
+                    OnValidatePrincipal = ctx =>
+                    {
+                        ctx.ShouldRenew = true;
+                        var id = ctx.Principal.Identities.First();
+                        var claim = id.FindFirst("counter");
+                        if (claim == null)
+                        {
+                            id.AddClaim(new Claim("counter", "1"));
+                        }
+                        else
+                        {
+                            id.RemoveClaim(claim);
+                            id.AddClaim(new Claim("counter", claim.Value + "1"));
+                        }
+                        return Task.FromResult(0);
+                    }
+                };
+            },
+            context =>
+                context.SignInAsync("Cookies",
+                    new ClaimsPrincipal(new ClaimsIdentity(new GenericIdentity("Alice", "Cookies")))));
+
+            var transaction1 = await SendAsync(server, "http://example.com/testpath");
+
+            var transaction2 = await SendAsync(server, "http://example.com/me/Cookies", transaction1.CookieNameValue);
+            Assert.NotNull(transaction2.SetCookie);
+            Assert.Equal("1", FindClaimValue(transaction2, "counter"));
+
+            _clock.Add(TimeSpan.FromMinutes(5));
+
+            var transaction3 = await SendAsync(server, "http://example.com/me/Cookies", transaction2.CookieNameValue);
+            Assert.NotNull(transaction3.SetCookie);
+            Assert.Equal("11", FindClaimValue(transaction3, "counter"));
+
+            _clock.Add(TimeSpan.FromMinutes(6));
+
+            var transaction4 = await SendAsync(server, "http://example.com/me/Cookies", transaction3.CookieNameValue);
+            Assert.NotNull(transaction4.SetCookie);
+            Assert.Equal("111", FindClaimValue(transaction4, "counter"));
+
+            _clock.Add(TimeSpan.FromMinutes(11));
+
+            var transaction5 = await SendAsync(server, "http://example.com/me/Cookies", transaction4.CookieNameValue);
+            Assert.Null(transaction5.SetCookie);
+            Assert.Null(FindClaimValue(transaction5, "counter"));
         }
 
         [Fact]
@@ -677,6 +802,51 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
                 o.SlidingExpiration = true;
             },
             SignInAsAlice);
+
+            var transaction1 = await SendAsync(server, "http://example.com/testpath");
+
+            var transaction2 = await SendAsync(server, "http://example.com/me/Cookies", transaction1.CookieNameValue);
+            Assert.Null(transaction2.SetCookie);
+            Assert.Equal("Alice", FindClaimValue(transaction2, ClaimTypes.Name));
+
+            _clock.Add(TimeSpan.FromMinutes(4));
+
+            var transaction3 = await SendAsync(server, "http://example.com/me/Cookies", transaction1.CookieNameValue);
+            Assert.Null(transaction3.SetCookie);
+            Assert.Equal("Alice", FindClaimValue(transaction3, ClaimTypes.Name));
+
+            _clock.Add(TimeSpan.FromMinutes(4));
+
+            // transaction4 should arrive with a new SetCookie value
+            var transaction4 = await SendAsync(server, "http://example.com/me/Cookies", transaction1.CookieNameValue);
+            Assert.NotNull(transaction4.SetCookie);
+            Assert.Equal("Alice", FindClaimValue(transaction4, ClaimTypes.Name));
+
+            _clock.Add(TimeSpan.FromMinutes(4));
+
+            var transaction5 = await SendAsync(server, "http://example.com/me/Cookies", transaction4.CookieNameValue);
+            Assert.Null(transaction5.SetCookie);
+            Assert.Equal("Alice", FindClaimValue(transaction5, ClaimTypes.Name));
+        }
+
+        [Fact]
+        public async Task CookieIsRenewedWithSlidingExpirationWithoutTransformations()
+        {
+            var server = CreateServer(o =>
+            {
+                o.ExpireTimeSpan = TimeSpan.FromMinutes(10);
+                o.SlidingExpiration = true;
+                o.Events.OnValidatePrincipal = c =>
+                {
+                    // https://github.com/aspnet/Security/issues/1607
+                    // On sliding refresh the transformed principal should not be serialized into the cookie, only the original principal.
+                    Assert.Single(c.Principal.Identities);
+                    Assert.True(c.Principal.Identities.First().HasClaim("marker", "true"));
+                    return Task.CompletedTask;
+                };
+            },
+            SignInAsAlice,
+            claimsTransform: true);
 
             var transaction1 = await SendAsync(server, "http://example.com/testpath");
 
@@ -1218,6 +1388,16 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
             return claim.Attribute("value").Value;
         }
 
+        private static string FindPropertiesValue(Transaction transaction, string key)
+        {
+            var property = transaction.ResponseElement.Elements("extra").SingleOrDefault(elt => elt.Attribute("type").Value == key);
+            if (property == null)
+            {
+                return null;
+            }
+            return property.Attribute("value").Value;
+        }
+
         private static async Task<XElement> GetAuthData(TestServer server, string url, string cookie)
         {
             var request = new HttpRequestMessage(HttpMethod.Get, url);
@@ -1233,6 +1413,13 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
         {
             public Task<ClaimsPrincipal> TransformAsync(ClaimsPrincipal p)
             {
+                var firstId = p.Identities.First();
+                if (firstId.HasClaim("marker", "true"))
+                {
+                    firstId.RemoveClaim(firstId.FindFirst("marker"));
+                }
+                // TransformAsync could be called twice on one request if you have a default scheme and also
+                // call AuthenticateAsync.
                 if (!p.Identities.Any(i => i.AuthenticationType == "xform"))
                 {
                     var id = new ClaimsIdentity("xform");
@@ -1248,7 +1435,10 @@ namespace Microsoft.AspNetCore.Authentication.Cookies
             {
                 s.AddSingleton<ISystemClock>(_clock);
                 s.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).AddCookie(configureOptions);
-                s.AddSingleton<IClaimsTransformation, ClaimsTransformer>();
+                if (claimsTransform)
+                {
+                    s.AddSingleton<IClaimsTransformation, ClaimsTransformer>();
+                }
             }, testpath, baseAddress);
 
         private static TestServer CreateServerWithServices(Action<IServiceCollection> configureServices, Func<HttpContext, Task> testpath = null, Uri baseAddress = null)

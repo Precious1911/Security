@@ -4,10 +4,14 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Reflection;
 using System.Text;
 using System.Text.Encodings.Web;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Xml.Linq;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.TestHost;
@@ -22,6 +26,7 @@ namespace Microsoft.AspNetCore.Authentication.Test.OpenIdConnect
     internal class TestSettings
     {
         private readonly Action<OpenIdConnectOptions> _configureOptions;
+        private OpenIdConnectOptions _options;
 
         public TestSettings() : this(configure: null)
         {
@@ -33,6 +38,7 @@ namespace Microsoft.AspNetCore.Authentication.Test.OpenIdConnect
             {
                 configure?.Invoke(o);
                 _options = o;
+                _options.BackchannelHttpHandler = new MockBackchannel();
             };
         }
 
@@ -189,7 +195,7 @@ namespace Microsoft.AspNetCore.Authentication.Test.OpenIdConnect
                         ValidateState(actualValues, errors, htmlEncoded);
                         break;
                     case OpenIdConnectParameterNames.SkuTelemetry:
-                        ValidateSkuTelemetry(actualValues, errors, htmlEncoded);
+                        ValidateSkuTelemetry(actualValues, errors);
                         break;
                     case OpenIdConnectParameterNames.VersionTelemetry:
                         ValidateVersionTelemetry(actualValues, errors, htmlEncoded);
@@ -200,13 +206,14 @@ namespace Microsoft.AspNetCore.Authentication.Test.OpenIdConnect
                     case OpenIdConnectParameterNames.MaxAge:
                         ValidateMaxAge(actualValues, errors, htmlEncoded);
                         break;
+                    case OpenIdConnectParameterNames.Prompt:
+                        ValidatePrompt(actualValues, errors, htmlEncoded);
+                        break;
                     default:
                         throw new InvalidOperationException($"Unknown parameter \"{paramToValidate}\".");
                 }
             }
         }
-
-        OpenIdConnectOptions _options = null;
 
         private void ValidateExpectedAuthority(string absoluteUri, ICollection<string> errors, OpenIdConnectRequestType requestType)
         {
@@ -251,14 +258,13 @@ namespace Microsoft.AspNetCore.Authentication.Test.OpenIdConnect
         private void ValidateState(IDictionary<string, string> actualParams, ICollection<string> errors, bool htmlEncoded) =>
             ValidateParameter(OpenIdConnectParameterNames.State, ExpectedState, actualParams, errors, htmlEncoded);
 
-        private void ValidateSkuTelemetry(IDictionary<string, string> actualParams, ICollection<string> errors, bool htmlEncoded) =>
-#if NETCOREAPP2_0
-            ValidateParameter(OpenIdConnectParameterNames.SkuTelemetry, "ID_NETSTANDARD1_4", actualParams, errors, htmlEncoded);
-#elif NET461
-            ValidateParameter(OpenIdConnectParameterNames.SkuTelemetry, "ID_NET451", actualParams, errors, htmlEncoded);
-#else
-#error Invalid target framework.
-#endif
+        private static void ValidateSkuTelemetry(IDictionary<string, string> actualParams, ICollection<string> errors)
+        {
+            if (!actualParams.ContainsKey(OpenIdConnectParameterNames.SkuTelemetry))
+            {
+                errors.Add($"Parameter {OpenIdConnectParameterNames.SkuTelemetry} is missing");
+            }
+        }
 
         private void ValidateVersionTelemetry(IDictionary<string, string> actualParams, ICollection<string> errors, bool htmlEncoded) =>
             ValidateParameter(OpenIdConnectParameterNames.VersionTelemetry, typeof(OpenIdConnectMessage).GetTypeInfo().Assembly.GetName().Version.ToString(), actualParams, errors, htmlEncoded);
@@ -279,6 +285,9 @@ namespace Microsoft.AspNetCore.Authentication.Test.OpenIdConnect
                 errors.Add($"Parameter {OpenIdConnectParameterNames.MaxAge} is present but it should be absent");
             }
         }
+
+        private void ValidatePrompt(IDictionary<string, string> actualParams, ICollection<string> errors, bool htmlEncoded) =>
+            ValidateParameter(OpenIdConnectParameterNames.Prompt, _options.Prompt, actualParams, errors, htmlEncoded);
 
         private void ValidateParameter(
             string parameterName,
@@ -303,6 +312,38 @@ namespace Microsoft.AspNetCore.Authentication.Test.OpenIdConnect
             else
             {
                 errors.Add($"Parameter {parameterName} is missing");
+            }
+        }
+
+        private class MockBackchannel : HttpMessageHandler
+        {
+            protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            {
+                if (request.RequestUri.AbsoluteUri.Equals("https://login.microsoftonline.com/common/.well-known/openid-configuration"))
+                {
+                    return await ReturnResource("wellknownconfig.json");
+                }
+                if (request.RequestUri.AbsoluteUri.Equals("https://login.microsoftonline.com/common/discovery/keys"))
+                {
+                    return await ReturnResource("wellknownkeys.json");
+                }
+
+                throw new NotImplementedException();
+            }
+
+            private async Task<HttpResponseMessage> ReturnResource(string resource)
+            {
+                var resourceName = "Microsoft.AspNetCore.Authentication.Test.OpenIdConnect." + resource;
+                using (var stream = typeof(MockBackchannel).Assembly.GetManifestResourceStream(resourceName))
+                using (var reader = new StreamReader(stream))
+                {
+                    var body = await reader.ReadToEndAsync();
+                    var content = new StringContent(body, Encoding.UTF8, "application/json");
+                    return new HttpResponseMessage()
+                    {
+                        Content = content,
+                    };
+                }
             }
         }
     }

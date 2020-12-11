@@ -1,51 +1,34 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
-using System;
-using System.Collections.Generic;
-using System.Net;
-using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Net.Http.Headers;
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace Microsoft.AspNetCore.Authentication.OAuth
 {
-    public class OAuthTests
+    public class OAuthTests : RemoteAuthenticationTests<OAuthOptions>
     {
-        [Fact]
-        public async Task VerifySignInSchemeCannotBeSetToSelf()
-        {
-            var server = CreateServer(
-                services => services.AddAuthentication().AddOAuth("weeblie", o =>
-                {
-                    o.SignInScheme = "weeblie";
-                    o.ClientId = "whatever";
-                    o.ClientSecret = "whatever";
-                    o.CallbackPath = "/whatever";
-                    o.AuthorizationEndpoint = "/whatever";
-                    o.TokenEndpoint = "/whatever";
-                }));
-            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => server.SendAsync("https://example.com/"));
-            Assert.Contains("cannot be set to itself", error.Message);
-        }
+        protected override string DefaultScheme => OAuthDefaults.DisplayName;
+        protected override Type HandlerType => typeof(OAuthHandler<OAuthOptions>);
+        protected override bool SupportsSignIn { get => false; }
+        protected override bool SupportsSignOut { get => false; }
 
-        [Fact]
-        public async Task VerifySchemeDefaults()
+        protected override void RegisterAuth(AuthenticationBuilder services, Action<OAuthOptions> configure)
         {
-            var services = new ServiceCollection();
-            services.AddAuthentication().AddOAuth("oauth", o => { });
-            var sp = services.BuildServiceProvider();
-            var schemeProvider = sp.GetRequiredService<IAuthenticationSchemeProvider>();
-            var scheme = await schemeProvider.GetSchemeAsync("oauth");
-            Assert.NotNull(scheme);
-            Assert.Equal("OAuthHandler`1", scheme.HandlerType.Name);
-            Assert.Equal(OAuthDefaults.DisplayName, scheme.DisplayName);
+            services.AddOAuth(DefaultScheme, o =>
+            {
+                ConfigureDefaults(o);
+                configure.Invoke(o);
+            });
         }
 
         [Fact]
@@ -131,12 +114,7 @@ namespace Microsoft.AspNetCore.Authentication.OAuth
                     "Weblie",
                     opt =>
                     {
-                        opt.ClientId = "Test Id";
-                        opt.ClientSecret = "secret";
-                        opt.SignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
-                        opt.AuthorizationEndpoint = "https://example.com/provider/login";
-                        opt.TokenEndpoint = "https://example.com/provider/token";
-                        opt.CallbackPath = "/oauth-callback";
+                        ConfigureDefaults(opt);
                     }),
                 async ctx =>
                 {
@@ -162,12 +140,7 @@ namespace Microsoft.AspNetCore.Authentication.OAuth
                     "Weblie",
                     opt =>
                     {
-                        opt.ClientId = "Test Id";
-                        opt.ClientSecret = "secret";
-                        opt.SignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
-                        opt.AuthorizationEndpoint = "https://example.com/provider/login";
-                        opt.TokenEndpoint = "https://example.com/provider/token";
-                        opt.CallbackPath = "/oauth-callback";
+                        ConfigureDefaults(opt);
                         opt.CorrelationCookie.Path = "/";
                     }),
                 async ctx =>
@@ -184,6 +157,193 @@ namespace Microsoft.AspNetCore.Authentication.OAuth
             var setCookie = Assert.Single(res.Headers, h => h.Key == "Set-Cookie");
             var correlation = Assert.Single(setCookie.Value, v => v.StartsWith(".AspNetCore.Correlation."));
             Assert.Contains("path=/", correlation);
+        }
+
+        [Fact]
+        public async Task RedirectToAuthorizeEndpoint_HasScopeAsConfigured()
+        {
+            var server = CreateServer(
+                s => s.AddAuthentication().AddOAuth(
+                    "Weblie",
+                    opt =>
+                    {
+                        ConfigureDefaults(opt);
+                        opt.Scope.Clear();
+                        opt.Scope.Add("foo");
+                        opt.Scope.Add("bar");
+                    }),
+                async ctx =>
+                {
+                    await ctx.ChallengeAsync("Weblie");
+                    return true;
+                });
+
+            var transaction = await server.SendAsync("https://www.example.com/challenge");
+            var res = transaction.Response;
+
+            Assert.Equal(HttpStatusCode.Redirect, res.StatusCode);
+            Assert.Contains("scope=foo%20bar", res.Headers.Location.Query);
+        }
+
+        [Fact]
+        public async Task RedirectToAuthorizeEndpoint_HasScopeAsOverwritten()
+        {
+            var server = CreateServer(
+                s => s.AddAuthentication().AddOAuth(
+                    "Weblie",
+                    opt =>
+                    {
+                        ConfigureDefaults(opt);
+                        opt.Scope.Clear();
+                        opt.Scope.Add("foo");
+                        opt.Scope.Add("bar");
+                    }),
+                async ctx =>
+                {
+                    var properties = new OAuthChallengeProperties();
+                    properties.SetScope("baz", "qux");
+                    await ctx.ChallengeAsync("Weblie", properties);
+                    return true;
+                });
+
+            var transaction = await server.SendAsync("https://www.example.com/challenge");
+            var res = transaction.Response;
+
+            Assert.Equal(HttpStatusCode.Redirect, res.StatusCode);
+            Assert.Contains("scope=baz%20qux", res.Headers.Location.Query);
+        }
+
+        [Fact]
+        public async Task RedirectToAuthorizeEndpoint_HasScopeAsOverwrittenWithBaseAuthenticationProperties()
+        {
+            var server = CreateServer(
+                s => s.AddAuthentication().AddOAuth(
+                    "Weblie",
+                    opt =>
+                    {
+                        ConfigureDefaults(opt);
+                        opt.Scope.Clear();
+                        opt.Scope.Add("foo");
+                        opt.Scope.Add("bar");
+                    }),
+                async ctx =>
+                {
+                    var properties = new AuthenticationProperties();
+                    properties.SetParameter(OAuthChallengeProperties.ScopeKey, new string[] { "baz", "qux" });
+                    await ctx.ChallengeAsync("Weblie", properties);
+                    return true;
+                });
+
+            var transaction = await server.SendAsync("https://www.example.com/challenge");
+            var res = transaction.Response;
+
+            Assert.Equal(HttpStatusCode.Redirect, res.StatusCode);
+            Assert.Contains("scope=baz%20qux", res.Headers.Location.Query);
+        }
+
+        protected override void ConfigureDefaults(OAuthOptions o)
+        {
+            o.ClientId = "Test Id";
+            o.ClientSecret = "secret";
+            o.SignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+            o.AuthorizationEndpoint = "https://example.com/provider/login";
+            o.TokenEndpoint = "https://example.com/provider/token";
+            o.CallbackPath = "/oauth-callback";
+        }
+
+        [Fact]
+        public async Task HandleRequestAsync_RedirectsToAccessDeniedPathWhenExplicitlySet()
+        {
+            var server = CreateServer(
+                s => s.AddAuthentication().AddOAuth(
+                    "Weblie",
+                    opt =>
+                    {
+                        opt.ClientId = "Test Id";
+                        opt.ClientSecret = "secret";
+                        opt.SignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                        opt.AuthorizationEndpoint = "https://example.com/provider/login";
+                        opt.TokenEndpoint = "https://example.com/provider/token";
+                        opt.CallbackPath = "/oauth-callback";
+                        opt.AccessDeniedPath = "/access-denied";
+                        opt.StateDataFormat = new TestStateDataFormat();
+                        opt.Events.OnRemoteFailure = context => throw new InvalidOperationException("This event should not be called.");
+                    }));
+
+            var transaction = await server.SendAsync("https://www.example.com/oauth-callback?error=access_denied&state=protected_state",
+                ".AspNetCore.Correlation.Weblie.correlationId=N");
+
+            Assert.Equal(HttpStatusCode.Redirect, transaction.Response.StatusCode);
+            Assert.Equal("/access-denied?ReturnUrl=http%3A%2F%2Ftesthost%2Fredirect", transaction.Response.Headers.Location.ToString());
+        }
+
+        [Fact]
+        public async Task HandleRequestAsync_InvokesAccessDeniedEvent()
+        {
+            var server = CreateServer(
+                s => s.AddAuthentication().AddOAuth(
+                    "Weblie",
+                    opt =>
+                    {
+                        opt.ClientId = "Test Id";
+                        opt.ClientSecret = "secret";
+                        opt.SignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                        opt.AuthorizationEndpoint = "https://example.com/provider/login";
+                        opt.TokenEndpoint = "https://example.com/provider/token";
+                        opt.CallbackPath = "/oauth-callback";
+                        opt.StateDataFormat = new TestStateDataFormat();
+                        opt.Events = new OAuthEvents()
+                        {
+                            OnAccessDenied = context =>
+                            {
+                                Assert.Equal("testvalue", context.Properties.Items["testkey"]);
+                                context.Response.StatusCode = StatusCodes.Status406NotAcceptable;
+                                context.HandleResponse();
+                                return Task.CompletedTask;
+                            }
+                        };
+                    }));
+
+            var transaction = await server.SendAsync("https://www.example.com/oauth-callback?error=access_denied&state=protected_state",
+                ".AspNetCore.Correlation.Weblie.correlationId=N");
+
+            Assert.Equal(HttpStatusCode.NotAcceptable, transaction.Response.StatusCode);
+            Assert.Null(transaction.Response.Headers.Location);
+        }
+
+        [Fact]
+        public async Task HandleRequestAsync_InvokesRemoteFailureEventWhenAccessDeniedPathIsNotExplicitlySet()
+        {
+            var server = CreateServer(
+                s => s.AddAuthentication().AddOAuth(
+                    "Weblie",
+                    opt =>
+                    {
+                        opt.ClientId = "Test Id";
+                        opt.ClientSecret = "secret";
+                        opt.SignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                        opt.AuthorizationEndpoint = "https://example.com/provider/login";
+                        opt.TokenEndpoint = "https://example.com/provider/token";
+                        opt.CallbackPath = "/oauth-callback";
+                        opt.StateDataFormat = new TestStateDataFormat();
+                        opt.Events = new OAuthEvents()
+                        {
+                            OnRemoteFailure = context =>
+                            {
+                                Assert.Equal("Access was denied by the resource owner or by the remote server.", context.Failure.Message);
+                                Assert.Equal("testvalue", context.Properties.Items["testkey"]);
+                                context.Response.StatusCode = StatusCodes.Status406NotAcceptable;
+                                context.HandleResponse();
+                                return Task.CompletedTask;
+                            }
+                        };
+                    }));
+
+            var transaction = await server.SendAsync("https://www.example.com/oauth-callback?error=access_denied&state=protected_state",
+                ".AspNetCore.Correlation.Weblie.correlationId=N");
+
+            Assert.Equal(HttpStatusCode.NotAcceptable, transaction.Response.StatusCode);
+            Assert.Null(transaction.Response.Headers.Location);
         }
 
         [Fact]
@@ -205,7 +365,7 @@ namespace Microsoft.AspNetCore.Authentication.OAuth
                         {
                             OnRemoteFailure = context =>
                             {
-                                Assert.Contains("declined", context.Failure.Message);
+                                Assert.Contains("custom_error", context.Failure.Message);
                                 Assert.Equal("testvalue", context.Properties.Items["testkey"]);
                                 context.Response.StatusCode = StatusCodes.Status406NotAcceptable;
                                 context.HandleResponse();
@@ -214,8 +374,8 @@ namespace Microsoft.AspNetCore.Authentication.OAuth
                         };
                     }));
 
-            var transaction = await server.SendAsync("https://www.example.com/oauth-callback?error=declined&state=protected_state",
-                ".AspNetCore.Correlation.Weblie.corrilationId=N");
+            var transaction = await server.SendAsync("https://www.example.com/oauth-callback?error=custom_error&state=protected_state",
+                ".AspNetCore.Correlation.Weblie.correlationId=N");
 
             Assert.Equal(HttpStatusCode.NotAcceptable, transaction.Response.StatusCode);
             Assert.Null(transaction.Response.Headers.Location);
@@ -258,7 +418,7 @@ namespace Microsoft.AspNetCore.Authentication.OAuth
                 Assert.Equal("protected_state", protectedText);
                 var properties = new AuthenticationProperties(new Dictionary<string, string>()
                 {
-                    { ".xsrf", "corrilationId" },
+                    { ".xsrf", "correlationId" },
                     { "testkey", "testvalue" }
                 });
                 properties.RedirectUri = "http://testhost/redirect";

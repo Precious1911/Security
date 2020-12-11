@@ -1,5 +1,15 @@
 // Copyright (c) .NET Foundation. All rights reserved. See License.txt in the project root for license information.
 
+using Microsoft.AspNetCore.Authentication.OAuth;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -9,45 +19,31 @@ using System.Security.Claims;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Authentication.OAuth;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.DataProtection;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.TestHost;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging.Abstractions;
-using Newtonsoft.Json;
 using Xunit;
 
 namespace Microsoft.AspNetCore.Authentication.Google
 {
-    public class GoogleTests
+    public class GoogleTests : RemoteAuthenticationTests<GoogleOptions>
     {
-        [Fact]
-        public async Task VerifySignInSchemeCannotBeSetToSelf()
+        protected override string DefaultScheme => GoogleDefaults.AuthenticationScheme;
+        protected override Type HandlerType => typeof(GoogleHandler);
+        protected override bool SupportsSignIn { get => false; }
+        protected override bool SupportsSignOut { get => false; }
+
+        protected override void RegisterAuth(AuthenticationBuilder services, Action<GoogleOptions> configure)
         {
-            var server = CreateServer(o =>
+            services.AddGoogle(o =>
             {
-                o.ClientId = "Test Id";
-                o.ClientSecret = "Test Secret";
-                o.SignInScheme = GoogleDefaults.AuthenticationScheme;
+                ConfigureDefaults(o);
+                configure.Invoke(o);
             });
-            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => server.SendAsync("https://example.com/challenge"));
-            Assert.Contains("cannot be set to itself", error.Message);
         }
 
-        [Fact]
-        public async Task VerifySchemeDefaults()
+        protected override void ConfigureDefaults(GoogleOptions o)
         {
-            var services = new ServiceCollection();
-            services.AddAuthentication().AddGoogle();
-            var sp = services.BuildServiceProvider();
-            var schemeProvider = sp.GetRequiredService<IAuthenticationSchemeProvider>();
-            var scheme = await schemeProvider.GetSchemeAsync(GoogleDefaults.AuthenticationScheme);
-            Assert.NotNull(scheme);
-            Assert.Equal("GoogleHandler", scheme.HandlerType.Name);
-            Assert.Equal(GoogleDefaults.AuthenticationScheme, scheme.DisplayName);
+            o.ClientId = "whatever";
+            o.ClientSecret = "whatever";
+            o.SignInScheme = "auth1";
         }
 
         [Fact]
@@ -61,7 +57,7 @@ namespace Microsoft.AspNetCore.Authentication.Google
             var transaction = await server.SendAsync("https://example.com/challenge");
             Assert.Equal(HttpStatusCode.Redirect, transaction.Response.StatusCode);
             var location = transaction.Response.Headers.Location.ToString();
-            Assert.Contains("https://accounts.google.com/o/oauth2/auth?response_type=code", location);
+            Assert.Contains("https://accounts.google.com/o/oauth2/v2/auth?response_type=code", location);
             Assert.Contains("&client_id=", location);
             Assert.Contains("&redirect_uri=", location);
             Assert.Contains("&scope=", location);
@@ -149,43 +145,160 @@ namespace Microsoft.AspNetCore.Authentication.Google
         }
 
         [Fact]
-        public async Task ChallengeWillUseAuthenticationPropertiesAsParameters()
+        public async Task ChallengeWillUseAuthenticationPropertiesParametersAsQueryArguments()
         {
+            var stateFormat = new PropertiesDataFormat(new EphemeralDataProtectionProvider(NullLoggerFactory.Instance).CreateProtector("GoogleTest"));
             var server = CreateServer(o =>
             {
                 o.ClientId = "Test Id";
                 o.ClientSecret = "Test Secret";
-                //AutomaticChallenge = true
+                o.StateDataFormat = stateFormat;
             },
             context =>
+            {
+                var req = context.Request;
+                var res = context.Response;
+                if (req.Path == new PathString("/challenge2"))
                 {
-                    var req = context.Request;
-                    var res = context.Response;
-                    if (req.Path == new PathString("/challenge2"))
+                    return context.ChallengeAsync("Google", new GoogleChallengeProperties
                     {
-                        return context.ChallengeAsync("Google", new AuthenticationProperties(
-                            new Dictionary<string, string>()
-                            {
-                                { "scope", "https://www.googleapis.com/auth/plus.login" },
-                                { "access_type", "offline" },
-                                { "approval_prompt", "force" },
-                                { "prompt", "consent" },
-                                { "login_hint", "test@example.com" },
-                                { "include_granted_scopes", "false" }
-                            }));
-                    }
+                        Scope = new string[] { "openid", "https://www.googleapis.com/auth/plus.login" },
+                        AccessType = "offline",
+                        ApprovalPrompt = "force",
+                        Prompt = "consent",
+                        LoginHint = "test@example.com",
+                        IncludeGrantedScopes = false,
+                    });
+                }
 
-                    return Task.FromResult<object>(null);
-                });
+                return Task.FromResult<object>(null);
+            });
             var transaction = await server.SendAsync("https://example.com/challenge2");
             Assert.Equal(HttpStatusCode.Redirect, transaction.Response.StatusCode);
-            var query = transaction.Response.Headers.Location.Query;
-            Assert.Contains("scope=" + UrlEncoder.Default.Encode("https://www.googleapis.com/auth/plus.login"), query);
-            Assert.Contains("access_type=offline", query);
-            Assert.Contains("approval_prompt=force", query);
-            Assert.Contains("prompt=consent", query);
-            Assert.Contains("include_granted_scopes=false", query);
-            Assert.Contains("login_hint=" + UrlEncoder.Default.Encode("test@example.com"), query);
+
+            // verify query arguments
+            var query = QueryHelpers.ParseQuery(transaction.Response.Headers.Location.Query);
+            Assert.Equal("openid https://www.googleapis.com/auth/plus.login", query["scope"]);
+            Assert.Equal("offline", query["access_type"]);
+            Assert.Equal("force", query["approval_prompt"]);
+            Assert.Equal("consent", query["prompt"]);
+            Assert.Equal("false", query["include_granted_scopes"]);
+            Assert.Equal("test@example.com", query["login_hint"]);
+
+            // verify that the passed items were not serialized
+            var stateProperties = stateFormat.Unprotect(query["state"]);
+            Assert.DoesNotContain("scope", stateProperties.Items.Keys);
+            Assert.DoesNotContain("access_type", stateProperties.Items.Keys);
+            Assert.DoesNotContain("include_granted_scopes", stateProperties.Items.Keys);
+            Assert.DoesNotContain("approval_prompt", stateProperties.Items.Keys);
+            Assert.DoesNotContain("prompt", stateProperties.Items.Keys);
+            Assert.DoesNotContain("login_hint", stateProperties.Items.Keys);
+        }
+
+        [Fact]
+        public async Task ChallengeWillUseAuthenticationPropertiesItemsAsParameters()
+        {
+            var stateFormat = new PropertiesDataFormat(new EphemeralDataProtectionProvider(NullLoggerFactory.Instance).CreateProtector("GoogleTest"));
+            var server = CreateServer(o =>
+            {
+                o.ClientId = "Test Id";
+                o.ClientSecret = "Test Secret";
+                o.StateDataFormat = stateFormat;
+            },
+            context =>
+            {
+                var req = context.Request;
+                var res = context.Response;
+                if (req.Path == new PathString("/challenge2"))
+                {
+                    return context.ChallengeAsync("Google", new AuthenticationProperties(new Dictionary<string, string>()
+                    {
+                        { "scope", "https://www.googleapis.com/auth/plus.login" },
+                        { "access_type", "offline" },
+                        { "approval_prompt", "force" },
+                        { "prompt", "consent" },
+                        { "login_hint", "test@example.com" },
+                        { "include_granted_scopes", "false" }
+                    }));
+                }
+
+                return Task.FromResult<object>(null);
+            });
+            var transaction = await server.SendAsync("https://example.com/challenge2");
+            Assert.Equal(HttpStatusCode.Redirect, transaction.Response.StatusCode);
+
+            // verify query arguments
+            var query = QueryHelpers.ParseQuery(transaction.Response.Headers.Location.Query);
+            Assert.Equal("https://www.googleapis.com/auth/plus.login", query["scope"]);
+            Assert.Equal("offline", query["access_type"]);
+            Assert.Equal("force", query["approval_prompt"]);
+            Assert.Equal("consent", query["prompt"]);
+            Assert.Equal("false", query["include_granted_scopes"]);
+            Assert.Equal("test@example.com", query["login_hint"]);
+
+            // verify that the passed items were not serialized
+            var stateProperties = stateFormat.Unprotect(query["state"]);
+            Assert.DoesNotContain("scope", stateProperties.Items.Keys);
+            Assert.DoesNotContain("access_type", stateProperties.Items.Keys);
+            Assert.DoesNotContain("include_granted_scopes", stateProperties.Items.Keys);
+            Assert.DoesNotContain("approval_prompt", stateProperties.Items.Keys);
+            Assert.DoesNotContain("prompt", stateProperties.Items.Keys);
+            Assert.DoesNotContain("login_hint", stateProperties.Items.Keys);
+        }
+
+        [Fact]
+        public async Task ChallengeWillUseAuthenticationPropertiesItemsAsQueryArgumentsButParametersWillOverwrite()
+        {
+            var stateFormat = new PropertiesDataFormat(new EphemeralDataProtectionProvider(NullLoggerFactory.Instance).CreateProtector("GoogleTest"));
+            var server = CreateServer(o =>
+            {
+                o.ClientId = "Test Id";
+                o.ClientSecret = "Test Secret";
+                o.StateDataFormat = stateFormat;
+            },
+            context =>
+            {
+                var req = context.Request;
+                var res = context.Response;
+                if (req.Path == new PathString("/challenge2"))
+                {
+                    return context.ChallengeAsync("Google", new GoogleChallengeProperties(new Dictionary<string, string>
+                    {
+                        ["scope"] = "https://www.googleapis.com/auth/plus.login",
+                        ["access_type"] = "offline",
+                        ["include_granted_scopes"] = "false",
+                        ["approval_prompt"] = "force",
+                        ["prompt"] = "login",
+                        ["login_hint"] = "this-will-be-overwritten@example.com",
+                    })
+                    {
+                        Prompt = "consent",
+                        LoginHint = "test@example.com",
+                    });
+                }
+
+                return Task.FromResult<object>(null);
+            });
+            var transaction = await server.SendAsync("https://example.com/challenge2");
+            Assert.Equal(HttpStatusCode.Redirect, transaction.Response.StatusCode);
+
+            // verify query arguments
+            var query = QueryHelpers.ParseQuery(transaction.Response.Headers.Location.Query);
+            Assert.Equal("https://www.googleapis.com/auth/plus.login", query["scope"]);
+            Assert.Equal("offline", query["access_type"]);
+            Assert.Equal("force", query["approval_prompt"]);
+            Assert.Equal("consent", query["prompt"]);
+            Assert.Equal("false", query["include_granted_scopes"]);
+            Assert.Equal("test@example.com", query["login_hint"]);
+
+            // verify that the passed items were not serialized
+            var stateProperties = stateFormat.Unprotect(query["state"]);
+            Assert.DoesNotContain("scope", stateProperties.Items.Keys);
+            Assert.DoesNotContain("access_type", stateProperties.Items.Keys);
+            Assert.DoesNotContain("include_granted_scopes", stateProperties.Items.Keys);
+            Assert.DoesNotContain("approval_prompt", stateProperties.Items.Keys);
+            Assert.DoesNotContain("prompt", stateProperties.Items.Keys);
+            Assert.DoesNotContain("login_hint", stateProperties.Items.Keys);
         }
 
         [Fact]
@@ -247,6 +360,70 @@ namespace Microsoft.AspNetCore.Authentication.Google
         [Theory]
         [InlineData(true)]
         [InlineData(false)]
+        public async Task ReplyPathWithAccessDeniedErrorFails(bool redirect)
+        {
+            var server = CreateServer(o =>
+            {
+                o.ClientId = "Test Id";
+                o.ClientSecret = "Test Secret";
+                o.StateDataFormat = new TestStateDataFormat();
+                o.Events = redirect ? new OAuthEvents()
+                {
+                    OnAccessDenied = ctx =>
+                    {
+                        ctx.Response.Redirect("/error?FailureMessage=AccessDenied");
+                        ctx.HandleResponse();
+                        return Task.FromResult(0);
+                    }
+                } : new OAuthEvents();
+            });
+            var sendTask = server.SendAsync("https://example.com/signin-google?error=access_denied&error_description=SoBad&error_uri=foobar&state=protected_state",
+                ".AspNetCore.Correlation.Google.correlationId=N");
+            if (redirect)
+            {
+                var transaction = await sendTask;
+                Assert.Equal(HttpStatusCode.Redirect, transaction.Response.StatusCode);
+                Assert.Equal("/error?FailureMessage=AccessDenied", transaction.Response.Headers.GetValues("Location").First());
+            }
+            else
+            {
+                var error = await Assert.ThrowsAnyAsync<Exception>(() => sendTask);
+                Assert.Equal("Access was denied by the resource owner or by the remote server.", error.GetBaseException().Message);
+            }
+        }
+
+        [Fact]
+        public async Task ReplyPathWithAccessDeniedError_AllowsCustomizingPath()
+        {
+            var server = CreateServer(o =>
+            {
+                o.ClientId = "Test Id";
+                o.ClientSecret = "Test Secret";
+                o.StateDataFormat = new TestStateDataFormat();
+                o.AccessDeniedPath = "/access-denied";
+                o.Events = new OAuthEvents()
+                {
+                    OnAccessDenied = ctx =>
+                    {
+                        Assert.Equal("/access-denied", ctx.AccessDeniedPath.Value);
+                        Assert.Equal("http://testhost/redirect", ctx.ReturnUrl);
+                        Assert.Equal("ReturnUrl", ctx.ReturnUrlParameter);
+                        ctx.AccessDeniedPath = "/custom-denied-page";
+                        ctx.ReturnUrl = "http://www.google.com/";
+                        ctx.ReturnUrlParameter = "rurl";
+                        return Task.FromResult(0);
+                    }
+                };
+            });
+            var transaction = await server.SendAsync("https://example.com/signin-google?error=access_denied&error_description=SoBad&error_uri=foobar&state=protected_state",
+                ".AspNetCore.Correlation.Google.correlationId=N");
+            Assert.Equal(HttpStatusCode.Redirect, transaction.Response.StatusCode);
+            Assert.Equal("/custom-denied-page?rurl=http%3A%2F%2Fwww.google.com%2F", transaction.Response.Headers.GetValues("Location").First());
+        }
+
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
         public async Task ReplyPathWithErrorFails(bool redirect)
         {
             var server = CreateServer(o =>
@@ -265,7 +442,7 @@ namespace Microsoft.AspNetCore.Authentication.Google
                 } : new OAuthEvents();
             });
             var sendTask = server.SendAsync("https://example.com/signin-google?error=OMG&error_description=SoBad&error_uri=foobar&state=protected_state",
-                ".AspNetCore.Correlation.Google.corrilationId=N");
+                ".AspNetCore.Correlation.Google.correlationId=N");
             if (redirect)
             {
                 var transaction = await sendTask;
@@ -990,7 +1167,7 @@ namespace Microsoft.AspNetCore.Authentication.Google
                         var res = context.Response;
                         if (req.Path == new PathString("/challenge"))
                         {
-                            await context.ChallengeAsync("Google");
+                            await context.ChallengeAsync();
                         }
                         else if (req.Path == new PathString("/challengeFacebook"))
                         {
@@ -1061,19 +1238,14 @@ namespace Microsoft.AspNetCore.Authentication.Google
                 .ConfigureServices(services =>
                 {
                     services.AddTransient<IClaimsTransformation, ClaimsTransformer>();
-                    services.AddAuthentication(o =>
-                    {
-                        o.DefaultScheme = TestExtensions.CookieAuthenticationScheme;
-                        o.DefaultChallengeScheme = GoogleDefaults.AuthenticationScheme;
-                    });
-                    services.AddAuthentication()
-                        .AddCookie(TestExtensions.CookieAuthenticationScheme)
+                    services.AddAuthentication(TestExtensions.CookieAuthenticationScheme)
+                        .AddCookie(TestExtensions.CookieAuthenticationScheme, o => o.ForwardChallenge = GoogleDefaults.AuthenticationScheme)
                         .AddGoogle(configureOptions)
                         .AddFacebook(o =>
-                    {
-                        o.AppId = "Test AppId";
-                        o.AppSecret = "Test AppSecrent";
-                    });
+                        {
+                            o.ClientId = "Test ClientId";
+                            o.ClientSecret = "Test AppSecrent";
+                        });
                 });
             return new TestServer(builder);
         }
@@ -1097,7 +1269,7 @@ namespace Microsoft.AspNetCore.Authentication.Google
                 Assert.Equal("protected_state", protectedText);
                 var properties = new AuthenticationProperties(new Dictionary<string, string>()
                 {
-                    { ".xsrf", "corrilationId" },
+                    { ".xsrf", "correlationId" },
                     { "testkey", "testvalue" }
                 });
                 properties.RedirectUri = "http://testhost/redirect";

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IdentityModel.Tokens.Jwt;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Encodings.Web;
@@ -44,6 +45,8 @@ namespace OpenIdConnectSample
 
         public void ConfigureServices(IServiceCollection services)
         {
+            JwtSecurityTokenHandler.DefaultInboundClaimTypeMap.Clear();
+
             services.AddAuthentication(sharedOptions =>
             {
                 sharedOptions.DefaultAuthenticateScheme = CookieAuthenticationDefaults.AuthenticationScheme;
@@ -56,9 +59,14 @@ namespace OpenIdConnectSample
                 o.ClientId = Configuration["oidc:clientid"];
                 o.ClientSecret = Configuration["oidc:clientsecret"]; // for code flow
                 o.Authority = Configuration["oidc:authority"];
+
                 o.ResponseType = OpenIdConnectResponseType.CodeIdToken;
                 o.SaveTokens = true;
                 o.GetClaimsFromUserInfoEndpoint = true;
+                o.AccessDeniedPath = "/access-denied-from-remote";
+
+                o.ClaimActions.MapAllExcept("aud", "iss", "iat", "nbf", "exp", "aio", "c_hash", "uti", "nonce");
+
                 o.Events = new OpenIdConnectEvents()
                 {
                     OnAuthenticationFailed = c =>
@@ -115,6 +123,16 @@ namespace OpenIdConnectSample
                     await context.SignOutAsync(OpenIdConnectDefaults.AuthenticationScheme, new AuthenticationProperties()
                     {
                         RedirectUri = "/signedout"
+                    });
+                    return;
+                }
+
+                if (context.Request.Path.Equals("/access-denied-from-remote"))
+                {
+                    await WriteHtmlAsync(response, async res =>
+                    {
+                        await res.WriteAsync($"<h1>Access Denied error received from the remote authorization server</h1>");
+                        await res.WriteAsync("<a class=\"btn btn-default\" href=\"/\">Home</a>");
                     });
                     return;
                 }
@@ -218,11 +236,28 @@ namespace OpenIdConnectSample
                     return;
                 }
 
+                if (context.Request.Path.Equals("/login-challenge"))
+                {
+                    // Challenge the user authentication, and force a login prompt by overwriting the
+                    // "prompt". This could be used for example to require the user to re-enter their
+                    // credentials at the authentication provider, to add an extra confirmation layer.
+                    await context.ChallengeAsync(OpenIdConnectDefaults.AuthenticationScheme, new OpenIdConnectChallengeProperties()
+                    {
+                        Prompt = "login",
+
+                        // it is also possible to specify different scopes, e.g.
+                        // Scope = new string[] { "openid", "profile", "other" }
+                    });
+
+                    return;
+                }
+
                 await WriteHtmlAsync(response, async res =>
                 {
                     await res.WriteAsync($"<h1>Hello Authenticated User {HtmlEncode(user.Identity.Name)}</h1>");
                     await res.WriteAsync("<a class=\"btn btn-default\" href=\"/refresh\">Refresh tokens</a>");
                     await res.WriteAsync("<a class=\"btn btn-default\" href=\"/restricted\">Restricted</a>");
+                    await res.WriteAsync("<a class=\"btn btn-default\" href=\"/login-challenge\">Login challenge</a>");
                     await res.WriteAsync("<a class=\"btn btn-default\" href=\"/signout\">Sign Out</a>");
                     await res.WriteAsync("<a class=\"btn btn-default\" href=\"/signout-remote\">Sign Out Remote</a>");
 

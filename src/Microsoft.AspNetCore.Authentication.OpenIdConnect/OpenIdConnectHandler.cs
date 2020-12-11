@@ -16,7 +16,6 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Microsoft.Extensions.Primitives;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.Net.Http.Headers;
@@ -30,23 +29,8 @@ namespace Microsoft.AspNetCore.Authentication.OpenIdConnect
     public class OpenIdConnectHandler : RemoteAuthenticationHandler<OpenIdConnectOptions>, IAuthenticationSignOutHandler
     {
         private const string NonceProperty = "N";
-        private const string UriSchemeDelimiter = "://";
 
         private const string HeaderValueEpocDate = "Thu, 01 Jan 1970 00:00:00 GMT";
-        private const string InputTagFormat = @"<input type=""hidden"" name=""{0}"" value=""{1}"" />";
-        private const string HtmlFormFormat = @"<!doctype html>
-<html>
-<head>
-    <title>Please wait while you're being redirected to the identity provider</title>
-</head>
-<body>
-    <form name=""form"" method=""post"" action=""{0}"">
-        {1}
-        <noscript>Click here to finish the process: <input type=""submit"" /></noscript>
-    </form>
-    <script>document.form.submit();</script>
-</body>
-</html>";
 
         private static readonly RandomNumberGenerator CryptoRandom = RandomNumberGenerator.Create();
 
@@ -171,6 +155,13 @@ namespace Microsoft.AspNetCore.Authentication.OpenIdConnect
         /// <returns>A task executing the sign out procedure</returns>
         public async virtual Task SignOutAsync(AuthenticationProperties properties)
         {
+            var target = ResolveTarget(Options.ForwardSignOut);
+            if (target != null)
+            {
+                await Context.SignOutAsync(target, properties);
+                return;
+            }
+
             properties = properties ?? new AuthenticationProperties();
 
             Logger.EnteringOpenIdAuthenticationHandlerHandleSignOutAsync(GetType().FullName);
@@ -195,7 +186,7 @@ namespace Microsoft.AspNetCore.Authentication.OpenIdConnect
                 properties.RedirectUri = BuildRedirectUriIfRelative(Options.SignedOutRedirectUri);
                 if (string.IsNullOrWhiteSpace(properties.RedirectUri))
                 {
-                    properties.RedirectUri = CurrentUri;
+                    properties.RedirectUri = OriginalPathBase + OriginalPath + Request.QueryString;
                 }
             }
             Logger.PostSignOutRedirect(properties.RedirectUri);
@@ -241,19 +232,7 @@ namespace Microsoft.AspNetCore.Authentication.OpenIdConnect
             }
             else if (Options.AuthenticationMethod == OpenIdConnectRedirectBehavior.FormPost)
             {
-                var inputs = new StringBuilder();
-                foreach (var parameter in message.Parameters)
-                {
-                    var name = HtmlEncoder.Encode(parameter.Key);
-                    var value = HtmlEncoder.Encode(parameter.Value);
-
-                    var input = string.Format(CultureInfo.InvariantCulture, InputTagFormat, name, value);
-                    inputs.AppendLine(input);
-                }
-
-                var issuer = HtmlEncoder.Encode(message.IssuerAddress);
-
-                var content = string.Format(CultureInfo.InvariantCulture, HtmlFormFormat, issuer, inputs);
+                var content = message.BuildFormPost();
                 var buffer = Encoding.UTF8.GetBytes(content);
 
                 Response.ContentLength = buffer.Length;
@@ -333,7 +312,7 @@ namespace Microsoft.AspNetCore.Authentication.OpenIdConnect
             // 2. CurrentUri if RedirectUri is not set)
             if (string.IsNullOrEmpty(properties.RedirectUri))
             {
-                properties.RedirectUri = CurrentUri;
+                properties.RedirectUri = OriginalPathBase + OriginalPath + Request.QueryString;
             }
             Logger.PostAuthenticationLocalRedirect(properties.RedirectUri);
 
@@ -350,15 +329,16 @@ namespace Microsoft.AspNetCore.Authentication.OpenIdConnect
                 RedirectUri = BuildRedirectUri(Options.CallbackPath),
                 Resource = Options.Resource,
                 ResponseType = Options.ResponseType,
-                Prompt = Options.Prompt,
-                Scope = string.Join(" ", Options.Scope)
+                Prompt = properties.GetParameter<string>(OpenIdConnectParameterNames.Prompt) ?? Options.Prompt,
+                Scope = string.Join(" ", properties.GetParameter<ICollection<string>>(OpenIdConnectParameterNames.Scope) ?? Options.Scope),
             };
 
             // Add the 'max_age' parameter to the authentication request if MaxAge is not null.
             // See http://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
-            if (Options.MaxAge.HasValue)
+            var maxAge = properties.GetParameter<TimeSpan?>(OpenIdConnectParameterNames.MaxAge) ?? Options.MaxAge;
+            if (maxAge.HasValue)
             {
-                message.MaxAge = Convert.ToInt64(Math.Floor((Options.MaxAge.Value).TotalSeconds))
+                message.MaxAge = Convert.ToInt64(Math.Floor((maxAge.Value).TotalSeconds))
                     .ToString(CultureInfo.InvariantCulture);
             }
 
@@ -422,19 +402,7 @@ namespace Microsoft.AspNetCore.Authentication.OpenIdConnect
             }
             else if (Options.AuthenticationMethod == OpenIdConnectRedirectBehavior.FormPost)
             {
-                var inputs = new StringBuilder();
-                foreach (var parameter in message.Parameters)
-                {
-                    var name = HtmlEncoder.Encode(parameter.Key);
-                    var value = HtmlEncoder.Encode(parameter.Value);
-
-                    var input = string.Format(CultureInfo.InvariantCulture, InputTagFormat, name, value);
-                    inputs.AppendLine(input);
-                }
-
-                var issuer = HtmlEncoder.Encode(message.IssuerAddress);
-
-                var content = string.Format(CultureInfo.InvariantCulture, HtmlFormFormat, issuer, inputs);
+                var content = message.BuildFormPost();
                 var buffer = Encoding.UTF8.GetBytes(content);
 
                 Response.ContentLength = buffer.Length;
@@ -552,6 +520,16 @@ namespace Microsoft.AspNetCore.Authentication.OpenIdConnect
                 // if any of the error fields are set, throw error null
                 if (!string.IsNullOrEmpty(authorizationResponse.Error))
                 {
+                    // Note: access_denied errors are special protocol errors indicating the user didn't
+                    // approve the authorization demand requested by the remote authorization server.
+                    // Since it's a frequent scenario (that is not caused by incorrect configuration),
+                    // denied errors are handled differently using HandleAccessDeniedErrorAsync().
+                    // Visit https://tools.ietf.org/html/rfc6749#section-4.1.2.1 for more information.
+                    if (string.Equals(authorizationResponse.Error, "access_denied", StringComparison.Ordinal))
+                    {
+                        return await HandleAccessDeniedErrorAsync(properties);
+                    }
+
                     return HandleRequestResult.Fail(CreateOpenIdConnectProtocolException(authorizationResponse, response: null), properties);
                 }
 
@@ -816,7 +794,7 @@ namespace Microsoft.AspNetCore.Authentication.OpenIdConnect
         /// <param name="properties">The authentication properties.</param>
         /// <returns><see cref="HandleRequestResult"/> which is used to determine if the remote authentication was successful.</returns>
         protected virtual async Task<HandleRequestResult> GetUserInformationAsync(
-            OpenIdConnectMessage message, JwtSecurityToken jwt, 
+            OpenIdConnectMessage message, JwtSecurityToken jwt,
             ClaimsPrincipal principal, AuthenticationProperties properties)
         {
             var userInfoEndpoint = _configuration?.UserInfoEndpoint;

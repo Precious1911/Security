@@ -1,14 +1,5 @@
 // Copyright (c) .NET Foundation. All rights reserved. See License.txt in the project root for license information.
 
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net;
-using System.Net.Http;
-using System.Security.Claims;
-using System.Text;
-using System.Text.Encodings.Web;
-using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authentication.MicrosoftAccount;
 using Microsoft.AspNetCore.Authentication.OAuth;
 using Microsoft.AspNetCore.Builder;
@@ -16,41 +7,42 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.TestHost;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
+using System;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Security.Claims;
+using System.Text;
+using System.Text.Encodings.Web;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace Microsoft.AspNetCore.Authentication.Tests.MicrosoftAccount
 {
-    public class MicrosoftAccountTests
+    public class MicrosoftAccountTests : RemoteAuthenticationTests<MicrosoftAccountOptions>
     {
-        [Fact]
-        public async Task VerifySignInSchemeCannotBeSetToSelf()
+        protected override string DefaultScheme => MicrosoftAccountDefaults.AuthenticationScheme;
+        protected override Type HandlerType => typeof(MicrosoftAccountHandler);
+        protected override bool SupportsSignIn { get => false; }
+        protected override bool SupportsSignOut { get => false; }
+
+        protected override void RegisterAuth(AuthenticationBuilder services, Action<MicrosoftAccountOptions> configure)
         {
-            var server = CreateServer(o =>
+            services.AddMicrosoftAccount(o =>
             {
-                o.ClientId = "Test Id";
-                o.ClientSecret = "Test Secret";
-                o.SignInScheme = MicrosoftAccountDefaults.AuthenticationScheme;
+                ConfigureDefaults(o);
+                configure.Invoke(o);
             });
-            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => server.SendAsync("https://example.com/challenge"));
-            Assert.Contains("cannot be set to itself", error.Message);
         }
 
-        [Fact]
-        public async Task VerifySchemeDefaults()
+        protected override void ConfigureDefaults(MicrosoftAccountOptions o)
         {
-            var services = new ServiceCollection();
-            services.AddAuthentication().AddMicrosoftAccount();
-            var sp = services.BuildServiceProvider();
-            var schemeProvider = sp.GetRequiredService<IAuthenticationSchemeProvider>();
-            var scheme = await schemeProvider.GetSchemeAsync(MicrosoftAccountDefaults.AuthenticationScheme);
-            Assert.NotNull(scheme);
-            Assert.Equal("MicrosoftAccountHandler", scheme.HandlerType.Name);
-            Assert.Equal(MicrosoftAccountDefaults.AuthenticationScheme, scheme.DisplayName);
+            o.ClientId = "whatever";
+            o.ClientSecret = "whatever";
+            o.SignInScheme = "auth1";
         }
 
         [Fact]
@@ -128,6 +120,57 @@ namespace Microsoft.AspNetCore.Authentication.Tests.MicrosoftAccount
             Assert.Contains("redirect_uri=", location);
             Assert.Contains("scope=", location);
             Assert.Contains("state=", location);
+        }
+
+        [Fact]
+        public async Task ChallengeWillIncludeScopeAsConfigured()
+        {
+            var server = CreateServer(o =>
+            {
+                o.ClientId = "Test Id";
+                o.ClientSecret = "Test Secret";
+                o.Scope.Clear();
+                o.Scope.Add("foo");
+                o.Scope.Add("bar");
+            });
+            var transaction = await server.SendAsync("http://example.com/challenge");
+            var res = transaction.Response;
+            Assert.Equal(HttpStatusCode.Redirect, res.StatusCode);
+            Assert.Contains("scope=foo%20bar", res.Headers.Location.Query);
+        }
+
+        [Fact]
+        public async Task ChallengeWillIncludeScopeAsOverwritten()
+        {
+            var server = CreateServer(o =>
+            {
+                o.ClientId = "Test Id";
+                o.ClientSecret = "Test Secret";
+                o.Scope.Clear();
+                o.Scope.Add("foo");
+                o.Scope.Add("bar");
+            });
+            var transaction = await server.SendAsync("http://example.com/challengeWithOtherScope");
+            var res = transaction.Response;
+            Assert.Equal(HttpStatusCode.Redirect, res.StatusCode);
+            Assert.Contains("scope=baz%20qux", res.Headers.Location.Query);
+        }
+
+        [Fact]
+        public async Task ChallengeWillIncludeScopeAsOverwrittenWithBaseAuthenticationProperties()
+        {
+            var server = CreateServer(o =>
+            {
+                o.ClientId = "Test Id";
+                o.ClientSecret = "Test Secret";
+                o.Scope.Clear();
+                o.Scope.Add("foo");
+                o.Scope.Add("bar");
+            });
+            var transaction = await server.SendAsync("http://example.com/challengeWithOtherScopeWithBaseAuthenticationProperties");
+            var res = transaction.Response;
+            Assert.Equal(HttpStatusCode.Redirect, res.StatusCode);
+            Assert.Contains("scope=baz%20qux", res.Headers.Location.Query);
         }
 
         [Fact]
@@ -212,6 +255,18 @@ namespace Microsoft.AspNetCore.Authentication.Tests.MicrosoftAccount
                         if (req.Path == new PathString("/challenge"))
                         {
                             await context.ChallengeAsync("Microsoft");
+                        }
+                        else if (req.Path == new PathString("/challengeWithOtherScope"))
+                        {
+                            var properties = new OAuthChallengeProperties();
+                            properties.SetScope("baz", "qux");
+                            await context.ChallengeAsync("Microsoft", properties);
+                        }
+                        else if (req.Path == new PathString("/challengeWithOtherScopeWithBaseAuthenticationProperties"))
+                        {
+                            var properties = new AuthenticationProperties();
+                            properties.SetParameter(OAuthChallengeProperties.ScopeKey, new string[] { "baz", "qux" });
+                            await context.ChallengeAsync("Microsoft", properties);
                         }
                         else if (req.Path == new PathString("/me"))
                         {

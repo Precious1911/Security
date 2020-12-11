@@ -2,7 +2,6 @@
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
-using System.Security.Claims;
 using System.Text.Encodings.Web;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
@@ -22,12 +21,12 @@ namespace Microsoft.AspNetCore.Authentication
 
         protected HttpRequest Request
         {
-            get { return Context.Request; }
+            get => Context.Request;
         }
 
         protected HttpResponse Response
         {
-            get { return Context.Response; }
+            get => Context.Response;
         }
 
         protected PathString OriginalPath => Context.Features.Get<IAuthenticationFeature>()?.OriginalPath ?? Request.Path;
@@ -52,10 +51,7 @@ namespace Microsoft.AspNetCore.Authentication
 
         protected string CurrentUri
         {
-            get
-            {
-                return Request.Scheme + "://" + Request.Host + Request.PathBase + Request.Path + Request.QueryString;
-            }
+            get => Request.Scheme + "://" + Request.Host + Request.PathBase + Request.Path + Request.QueryString;
         }
 
         protected AuthenticationHandler(IOptionsMonitor<TOptions> options, ILoggerFactory logger, UrlEncoder encoder, ISystemClock clock)
@@ -116,18 +112,29 @@ namespace Microsoft.AspNetCore.Authentication
         /// Called after options/events have been initialized for the handler to finish initializing itself.
         /// </summary>
         /// <returns>A task</returns>
-        protected virtual Task InitializeHandlerAsync()
-        {
-            return Task.CompletedTask;
-        }
+        protected virtual Task InitializeHandlerAsync() => Task.CompletedTask;
 
         protected string BuildRedirectUri(string targetPath)
+            => Request.Scheme + "://" + Request.Host + OriginalPathBase + targetPath;
+
+        protected virtual string ResolveTarget(string scheme)
         {
-            return Request.Scheme + "://" + Request.Host + OriginalPathBase + targetPath;
+            var target = scheme ?? Options.ForwardDefaultSelector?.Invoke(Context) ?? Options.ForwardDefault;
+
+            // Prevent self targetting
+            return string.Equals(target, Scheme.Name, StringComparison.Ordinal)
+                ? null
+                : target;
         }
 
         public async Task<AuthenticateResult> AuthenticateAsync()
         {
+            var target = ResolveTarget(Options.ForwardAuthenticate);
+            if (target != null)
+            {
+                return await Context.AuthenticateAsync(target);
+            }
+
             // Calling Authenticate more than once should always return the original value.
             var result = await HandleAuthenticateOnceAsync();
             if (result?.Failure == null)
@@ -208,6 +215,13 @@ namespace Microsoft.AspNetCore.Authentication
 
         public async Task ChallengeAsync(AuthenticationProperties properties)
         {
+            var target = ResolveTarget(Options.ForwardChallenge);
+            if (target != null)
+            {
+                await Context.ChallengeAsync(target, properties);
+                return;
+            }
+
             properties = properties ?? new AuthenticationProperties();
             await HandleChallengeAsync(properties);
             Logger.AuthenticationSchemeChallenged(Scheme.Name);
@@ -215,6 +229,13 @@ namespace Microsoft.AspNetCore.Authentication
 
         public async Task ForbidAsync(AuthenticationProperties properties)
         {
+            var target = ResolveTarget(Options.ForwardForbid);
+            if (target != null)
+            {
+                await Context.ForbidAsync(target, properties);
+                return;
+            }
+
             properties = properties ?? new AuthenticationProperties();
             await HandleForbiddenAsync(properties);
             Logger.AuthenticationSchemeForbidden(Scheme.Name);
